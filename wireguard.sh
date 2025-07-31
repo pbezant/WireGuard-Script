@@ -83,28 +83,76 @@ import_config() {
 # Function to check if config is already connected
 is_config_connected() {
     local config_name="$1"
+    local config_file="$USER_CONFIG_DIR/$config_name"
     local config_base=$(basename "$config_name" .conf)
     
-    # Check if the interface is already up using ifconfig instead of wg show
-    # First try with wg show
-    if sudo wg show interfaces 2>/dev/null | grep -q "$config_base"; then
-        return 0  # Already connected
+    # First, check if there are any active WireGuard interfaces
+    local active_interfaces=()
+    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
+        if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
+            active_interfaces+=("$iface")
+        fi
+    done
+    
+    # If no active interfaces, definitely not connected
+    if [ ${#active_interfaces[@]} -eq 0 ]; then
+        return 1
     fi
     
-    # Also check network interfaces (for macOS)
-    if ifconfig | grep -q "utun" && sudo wg show 2>/dev/null | grep -q "interface"; then
-        # Check if we can find the interface in wg
-        for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
-            if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
-                return 0  # Found a WireGuard interface
-            fi
-        done
+    # If config file doesn't exist, can't be connected
+    if [ ! -f "$config_file" ]; then
+        return 1
     fi
     
-    return 1  # Not connected
+    # Get the public key from the config file to match against active interfaces
+    local config_public_key=$(grep "^PublicKey" "$config_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+    
+    if [ -z "$config_public_key" ]; then
+        return 1
+    fi
+    
+    # Check each active interface to see if it matches this configuration
+    for iface in "${active_interfaces[@]}"; do
+        local interface_peers=$(sudo wg show "$iface" peers 2>/dev/null)
+        if echo "$interface_peers" | grep -q "$config_public_key"; then
+            return 0  # Found matching configuration
+        fi
+    done
+    
+    return 1  # Configuration not found in any active interface
 }
 
-# Function to get active wireguard interface
+# Function to get active wireguard interface for a specific config
+get_active_interface_for_config() {
+    local config_name="$1"
+    local config_file="$USER_CONFIG_DIR/$config_name"
+    
+    if [ ! -f "$config_file" ]; then
+        return 1
+    fi
+    
+    # Get the public key from the config file
+    local config_public_key=$(grep "^PublicKey" "$config_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+    
+    if [ -z "$config_public_key" ]; then
+        return 1
+    fi
+    
+    # Check each utun interface
+    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
+        if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
+            local interface_peers=$(sudo wg show "$iface" peers 2>/dev/null)
+            if echo "$interface_peers" | grep -q "$config_public_key"; then
+                echo "$iface"
+                return 0
+            fi
+        fi
+    done
+    
+    return 1
+}
+
+# Function to get active wireguard interface (any active interface)
 get_active_interface() {
     for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
         if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
@@ -118,15 +166,31 @@ get_active_interface() {
 
 # Function to get active configuration name
 get_active_config() {
+    # Get any active interface first
+    local active_interface=$(get_active_interface)
+    
+    if [ -z "$active_interface" ]; then
+        return 1
+    fi
+    
+    # Get the public key from the active interface
+    local active_public_key=$(sudo wg show "$active_interface" peers 2>/dev/null | head -1)
+    
+    if [ -z "$active_public_key" ]; then
+        return 1
+    fi
+    
+    # Find which configuration file matches this public key
     for config in "$USER_CONFIG_DIR"/*.conf; do
         if [ -f "$config" ]; then
-            config_name=$(basename "$config")
-            if is_config_connected "$config_name"; then
-                echo "$config_name"
+            local config_public_key=$(grep "^PublicKey" "$config" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            if [ "$config_public_key" = "$active_public_key" ]; then
+                basename "$config"
                 return 0
             fi
         fi
     done
+    
     echo ""
     return 1
 }
@@ -290,12 +354,41 @@ connect_to_config() {
         return 1
     fi
     
-    # Connect using sudo 
-    if sudo wg-quick up "$config_file"; then
+    # Validate configuration before attempting connection
+    echo -e "${YELLOW}Validating configuration...${NC}"
+    if ! validate_config "$config_file"; then
+        echo -e "${RED}Configuration validation failed. Please check your config file.${NC}"
+        return 1
+    fi
+    
+    # Create temporary log file for detailed error output
+    local log_file="/tmp/wireguard_connection_$(date +%s).log"
+    
+    # Connect using sudo with detailed error capture
+    echo -e "${BLUE}Attempting connection...${NC}"
+    if sudo wg-quick up "$config_file" 2>"$log_file"; then
         echo -e "${GREEN}Connected to $config_name${NC}"
+        # Clean up log file on success
+        rm -f "$log_file"
         return 0
     else
-        echo -e "${RED}Failed to connect to $config_name. Error code: $?${NC}"
+        local exit_code=$?
+        echo -e "${RED}Failed to connect to $config_name (Exit code: $exit_code)${NC}"
+        
+        # Display detailed error information
+        if [ -f "$log_file" ]; then
+            echo -e "${YELLOW}Error details:${NC}"
+            while IFS= read -r line; do
+                echo -e "${RED}  $line${NC}"
+            done < "$log_file"
+            
+            # Provide specific troubleshooting based on common errors
+            provide_troubleshooting_hints "$log_file"
+            
+            # Keep log file for user reference
+            echo -e "${YELLOW}Full error log saved to: $log_file${NC}"
+        fi
+        
         echo -e "${YELLOW}The interface may already be active. Trying to disconnect first...${NC}"
         
         # Try to disconnect any existing interfaces first
@@ -303,13 +396,143 @@ connect_to_config() {
         
         # Try to connect again
         echo -e "${BLUE}Trying to connect again...${NC}"
-        if sudo wg-quick up "$config_file"; then
+        if sudo wg-quick up "$config_file" 2>"$log_file"; then
             echo -e "${GREEN}Connected to $config_name${NC}"
+            rm -f "$log_file"
             return 0
         else
             echo -e "${RED}Failed to connect to $config_name again.${NC}"
+            if [ -f "$log_file" ]; then
+                echo -e "${YELLOW}Second attempt error details:${NC}"
+                while IFS= read -r line; do
+                    echo -e "${RED}  $line${NC}"
+                done < "$log_file"
+            fi
             return 1
         fi
+    fi
+}
+
+# Function to validate configuration file
+validate_config() {
+    local config_file="$1"
+    local errors=0
+    
+    echo -e "${BLUE}Checking configuration syntax...${NC}"
+    
+    # Check if file exists and is readable
+    if [ ! -r "$config_file" ]; then
+        echo -e "${RED}  ✗ Configuration file is not readable${NC}"
+        return 1
+    fi
+    
+    # Check for required sections
+    if ! grep -q "^\[Interface\]" "$config_file"; then
+        echo -e "${RED}  ✗ Missing [Interface] section${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ [Interface] section found${NC}"
+    fi
+    
+    if ! grep -q "^\[Peer\]" "$config_file"; then
+        echo -e "${RED}  ✗ Missing [Peer] section${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ [Peer] section found${NC}"
+    fi
+    
+    # Check for required Interface fields
+    if ! grep -q "^PrivateKey" "$config_file"; then
+        echo -e "${RED}  ✗ Missing PrivateKey in [Interface]${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ PrivateKey found${NC}"
+    fi
+    
+    if ! grep -q "^Address" "$config_file"; then
+        echo -e "${RED}  ✗ Missing Address in [Interface]${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ Address found${NC}"
+    fi
+    
+    # Check for required Peer fields
+    if ! grep -q "^PublicKey" "$config_file"; then
+        echo -e "${RED}  ✗ Missing PublicKey in [Peer]${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ PublicKey found${NC}"
+    fi
+    
+    if ! grep -q "^Endpoint" "$config_file"; then
+        echo -e "${RED}  ✗ Missing Endpoint in [Peer]${NC}"
+        errors=$((errors + 1))
+    else
+        echo -e "${GREEN}  ✓ Endpoint found${NC}"
+        
+        # Test endpoint connectivity
+        local endpoint=$(grep "^Endpoint" "$config_file" | cut -d'=' -f2 | tr -d ' ')
+        local host=$(echo "$endpoint" | cut -d':' -f1)
+        local port=$(echo "$endpoint" | cut -d':' -f2)
+        
+        echo -e "${BLUE}Testing endpoint connectivity...${NC}"
+        if nc -z -w5 "$host" "$port" 2>/dev/null; then
+            echo -e "${GREEN}  ✓ Endpoint $endpoint is reachable${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ Endpoint $endpoint may not be reachable${NC}"
+            echo -e "${YELLOW}    This could be due to firewall or network issues${NC}"
+        fi
+    fi
+    
+    # Check file permissions
+    local perms=$(stat -f "%OLp" "$config_file" 2>/dev/null || stat -c "%a" "$config_file" 2>/dev/null)
+    if [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
+        echo -e "${YELLOW}  ⚠ Configuration file permissions are $perms (recommended: 600)${NC}"
+        echo -e "${YELLOW}    Run: chmod 600 '$config_file'${NC}"
+    else
+        echo -e "${GREEN}  ✓ File permissions are secure${NC}"
+    fi
+    
+    if [ $errors -eq 0 ]; then
+        echo -e "${GREEN}Configuration validation passed!${NC}"
+        return 0
+    else
+        echo -e "${RED}Configuration validation failed with $errors error(s)${NC}"
+        return 1
+    fi
+}
+
+# Function to provide troubleshooting hints based on error patterns
+provide_troubleshooting_hints() {
+    local log_file="$1"
+    
+    if grep -q "Permission denied" "$log_file"; then
+        echo -e "${YELLOW}Troubleshooting hint: Permission denied error${NC}"
+        echo -e "${YELLOW}  Try: sudo chmod 600 ~/.wireguard/*.conf${NC}"
+        echo -e "${YELLOW}  Or check if you need to run with different privileges${NC}"
+    fi
+    
+    if grep -q "Address already in use" "$log_file"; then
+        echo -e "${YELLOW}Troubleshooting hint: Address already in use${NC}"
+        echo -e "${YELLOW}  Another VPN or WireGuard instance may be running${NC}"
+        echo -e "${YELLOW}  Try disconnecting other VPNs first${NC}"
+    fi
+    
+    if grep -q "Network is unreachable" "$log_file"; then
+        echo -e "${YELLOW}Troubleshooting hint: Network unreachable${NC}"
+        echo -e "${YELLOW}  Check your internet connection${NC}"
+        echo -e "${YELLOW}  Verify the endpoint address and port${NC}"
+    fi
+    
+    if grep -q "Invalid key" "$log_file"; then
+        echo -e "${YELLOW}Troubleshooting hint: Invalid key error${NC}"
+        echo -e "${YELLOW}  Check that your private/public keys are correct${NC}"
+        echo -e "${YELLOW}  Keys should be 44 characters long and base64 encoded${NC}"
+    fi
+    
+    if grep -q "RTNETLINK answers: File exists" "$log_file"; then
+        echo -e "${YELLOW}Troubleshooting hint: Interface already exists${NC}"
+        echo -e "${YELLOW}  Try disconnecting first, then reconnecting${NC}"
     fi
 }
 
@@ -332,14 +555,14 @@ disconnect_from_config() {
     
     echo -e "${BLUE}Disconnecting from $config_name...${NC}"
     
-    # Before disconnecting, find the interface to disconnect
-    local interface=""
-    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
-        if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
-            interface="$iface"
-            break
-        fi
-    done
+    # Find the specific interface for this configuration
+    local interface=$(get_active_interface_for_config "$config_name")
+    
+    if [ -z "$interface" ]; then
+        echo -e "${YELLOW}Could not find active interface for $config_name${NC}"
+        # Fallback to trying the config file directly
+        interface=""
+    fi
     
     # Try the standard way first
     if sudo wg-quick down "$config_file" 2>/dev/null; then
@@ -347,7 +570,7 @@ disconnect_from_config() {
         return 0
     fi
     
-    # If that fails, try to directly disconnect the interface we found
+    # If that fails and we found a specific interface, try to disconnect it directly
     if [ -n "$interface" ]; then
         echo -e "${YELLOW}Trying to disconnect interface $interface directly...${NC}"
         if sudo wg-quick down "$interface" 2>/dev/null; then
@@ -383,11 +606,54 @@ list_configs() {
         if [ -f "$config" ]; then
             config_name=$(basename "$config")
             if is_config_connected "$config_name"; then
-                echo -e "${i}. ${GREEN}$config_name (CONNECTED)${NC}"
+                local interface=$(get_active_interface_for_config "$config_name")
+                echo -e "${i}. ${GREEN}$config_name (CONNECTED - $interface)${NC}"
             else
                 echo -e "${i}. $config_name"
             fi
             i=$((i+1))
+        fi
+    done
+}
+
+# Function to show detailed connection debug info (for troubleshooting)
+show_connection_debug() {
+    echo -e "${BLUE}Connection Debug Information${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    # Show all utun interfaces
+    echo -e "${YELLOW}All utun interfaces:${NC}"
+    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
+        echo -e "  $iface"
+    done
+    
+    # Show active WireGuard interfaces
+    echo -e "${YELLOW}Active WireGuard interfaces:${NC}"
+    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
+        if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
+            echo -e "${GREEN}  $iface (WireGuard active)${NC}"
+            local peers=$(sudo wg show "$iface" peers 2>/dev/null)
+            if [ -n "$peers" ]; then
+                echo -e "${BLUE}    Peer: $peers${NC}"
+            fi
+        fi
+    done
+    
+    # Show configuration file analysis
+    echo -e "${YELLOW}Configuration file analysis:${NC}"
+    for config in "$USER_CONFIG_DIR"/*.conf; do
+        if [ -f "$config" ]; then
+            config_name=$(basename "$config")
+            local public_key=$(grep "^PublicKey" "$config" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            echo -e "  $config_name:"
+            echo -e "    PublicKey: $public_key"
+            
+            if is_config_connected "$config_name"; then
+                local interface=$(get_active_interface_for_config "$config_name")
+                echo -e "${GREEN}    Status: CONNECTED ($interface)${NC}"
+            else
+                echo -e "${RED}    Status: NOT CONNECTED${NC}"
+            fi
         fi
     done
 }
@@ -521,8 +787,290 @@ display_menu() {
     printf "${YELLOW}3. Disconnect from a configuration${NC}\n"
     printf "${YELLOW}4. List configurations${NC}\n"
     printf "${YELLOW}5. Toggle metrics display${NC}\n"
-    printf "${YELLOW}6. Quit${NC}\n"
+    printf "${YELLOW}6. Diagnostic tools${NC}\n"
+    printf "${YELLOW}7. Quit${NC}\n"
     printf "${YELLOW}Select an option: ${NC}"
+}
+
+# Function to run diagnostic tools
+run_diagnostics() {
+    clear_below_metrics
+    echo -e "${BLUE}WireGuard Diagnostic Tools${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    echo -e "${YELLOW}1. Test configuration file${NC}"
+    echo -e "${YELLOW}2. Network connectivity test${NC}"
+    echo -e "${YELLOW}3. DNS resolution test${NC}"
+    echo -e "${YELLOW}4. System information${NC}"
+    echo -e "${YELLOW}5. View connection logs${NC}"
+    echo -e "${YELLOW}6. Fix permissions${NC}"
+    echo -e "${YELLOW}7. Connection debug info${NC}"
+    echo -e "${YELLOW}0. Back to main menu${NC}"
+    echo -ne "${YELLOW}Select diagnostic option: ${NC}"
+    read -r diag_option
+    
+    case $diag_option in
+        1)
+            test_configuration
+            ;;
+        2)
+            test_network_connectivity
+            ;;
+        3)
+            test_dns_resolution
+            ;;
+        4)
+            show_system_info
+            ;;
+        5)
+            view_connection_logs
+            ;;
+        6)
+            fix_permissions
+            ;;
+        7)
+            show_connection_debug
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            sleep 1
+            ;;
+    esac
+    
+    echo -e "${YELLOW}Press any key to continue...${NC}"
+    read -n 1
+}
+
+# Function to test a specific configuration
+test_configuration() {
+    clear_below_metrics
+    echo -e "${BLUE}Configuration File Test${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    list_configs
+    
+    if [ -z "$(ls -A "$USER_CONFIG_DIR" 2>/dev/null)" ]; then
+        echo -e "${YELLOW}No configurations found to test.${NC}"
+        return
+    fi
+    
+    echo -ne "${YELLOW}Enter the number of the configuration to test (or 0 to cancel): ${NC}"
+    read -r config_number
+    
+    if [ "$config_number" = "0" ]; then
+        return
+    fi
+    
+    local i=1
+    for config in "$USER_CONFIG_DIR"/*.conf; do
+        if [ -f "$config" ]; then
+            if [ "$i" = "$config_number" ]; then
+                config_name=$(basename "$config")
+                echo -e "${BLUE}Testing configuration: $config_name${NC}"
+                validate_config "$config"
+                return
+            fi
+            i=$((i+1))
+        fi
+    done
+    
+    echo -e "${RED}Invalid configuration number.${NC}"
+}
+
+# Function to test network connectivity
+test_network_connectivity() {
+    clear_below_metrics
+    echo -e "${BLUE}Network Connectivity Test${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    # Test basic internet connectivity
+    echo -e "${YELLOW}Testing basic internet connectivity...${NC}"
+    if ping -c 3 8.8.8.8 >/dev/null 2>&1; then
+        echo -e "${GREEN}  ✓ Internet connectivity: OK${NC}"
+    else
+        echo -e "${RED}  ✗ Internet connectivity: FAILED${NC}"
+        echo -e "${RED}    Check your network connection${NC}"
+        return
+    fi
+    
+    # Test DNS resolution
+    echo -e "${YELLOW}Testing DNS resolution...${NC}"
+    if nslookup google.com >/dev/null 2>&1; then
+        echo -e "${GREEN}  ✓ DNS resolution: OK${NC}"
+    else
+        echo -e "${RED}  ✗ DNS resolution: FAILED${NC}"
+    fi
+    
+    # Test endpoint connectivity for each config
+    echo -e "${YELLOW}Testing WireGuard endpoints...${NC}"
+    for config in "$USER_CONFIG_DIR"/*.conf; do
+        if [ -f "$config" ]; then
+            config_name=$(basename "$config")
+            if grep -q "^Endpoint" "$config"; then
+                local endpoint=$(grep "^Endpoint" "$config" | cut -d'=' -f2 | tr -d ' ')
+                local host=$(echo "$endpoint" | cut -d':' -f1)
+                local port=$(echo "$endpoint" | cut -d':' -f2)
+                
+                echo -e "${BLUE}  Testing $config_name endpoint: $endpoint${NC}"
+                if nc -z -w5 "$host" "$port" 2>/dev/null; then
+                    echo -e "${GREEN}    ✓ Endpoint reachable${NC}"
+                else
+                    echo -e "${RED}    ✗ Endpoint unreachable${NC}"
+                fi
+            fi
+        fi
+    done
+}
+
+# Function to test DNS resolution
+test_dns_resolution() {
+    clear_below_metrics
+    echo -e "${BLUE}DNS Resolution Test${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    local test_domains=("google.com" "cloudflare.com" "github.com")
+    
+    for domain in "${test_domains[@]}"; do
+        echo -e "${YELLOW}Testing DNS resolution for $domain...${NC}"
+        if nslookup "$domain" >/dev/null 2>&1; then
+            local ip=$(nslookup "$domain" | grep "Address" | tail -1 | awk '{print $2}')
+            echo -e "${GREEN}  ✓ $domain resolves to $ip${NC}"
+        else
+            echo -e "${RED}  ✗ Failed to resolve $domain${NC}"
+        fi
+    done
+    
+    # Check current DNS servers
+    echo -e "${YELLOW}Current DNS servers:${NC}"
+    if command -v scutil &> /dev/null; then
+        scutil --dns | grep "nameserver" | head -5
+    else
+        cat /etc/resolv.conf | grep nameserver
+    fi
+}
+
+# Function to show system information
+show_system_info() {
+    clear_below_metrics
+    echo -e "${BLUE}System Information${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    echo -e "${YELLOW}Operating System:${NC}"
+    sw_vers
+    
+    echo -e "${YELLOW}WireGuard Tools:${NC}"
+    if command -v wg &> /dev/null; then
+        echo -e "${GREEN}  wg: $(wg --version 2>&1 | head -1)${NC}"
+    else
+        echo -e "${RED}  wg: Not installed${NC}"
+    fi
+    
+    if command -v wg-quick &> /dev/null; then
+        echo -e "${GREEN}  wg-quick: Available${NC}"
+    else
+        echo -e "${RED}  wg-quick: Not available${NC}"
+    fi
+    
+    echo -e "${YELLOW}Network Interfaces:${NC}"
+    ifconfig -l | tr ' ' '\n' | while read -r iface; do
+        if [[ "$iface" == utun* ]]; then
+            echo -e "${GREEN}  $iface (potential WireGuard interface)${NC}"
+        elif [[ "$iface" == en* ]] || [[ "$iface" == wi* ]]; then
+            echo -e "${BLUE}  $iface (network interface)${NC}"
+        fi
+    done
+    
+    echo -e "${YELLOW}Active WireGuard Interfaces:${NC}"
+    local found_wg=false
+    for iface in $(ifconfig -l | tr ' ' '\n' | grep utun); do
+        if sudo wg show "$iface" 2>/dev/null | grep -q "interface"; then
+            echo -e "${GREEN}  $iface${NC}"
+            found_wg=true
+        fi
+    done
+    
+    if [ "$found_wg" = false ]; then
+        echo -e "${YELLOW}  No active WireGuard interfaces${NC}"
+    fi
+}
+
+# Function to view connection logs
+view_connection_logs() {
+    clear_below_metrics
+    echo -e "${BLUE}Connection Logs${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    echo -e "${YELLOW}Recent WireGuard connection logs:${NC}"
+    
+    # Check for recent log files
+    local log_files=$(find /tmp -name "wireguard_connection_*.log" -mtime -1 2>/dev/null)
+    
+    if [ -z "$log_files" ]; then
+        echo -e "${YELLOW}No recent connection logs found.${NC}"
+        echo -e "${YELLOW}Logs are created when connection attempts fail.${NC}"
+    else
+        echo "$log_files" | while read -r log_file; do
+            if [ -f "$log_file" ]; then
+                echo -e "${BLUE}Log file: $log_file${NC}"
+                echo -e "${YELLOW}Contents:${NC}"
+                cat "$log_file" | while IFS= read -r line; do
+                    echo -e "${RED}  $line${NC}"
+                done
+                echo ""
+            fi
+        done
+    fi
+    
+    # Show system logs related to WireGuard
+    echo -e "${YELLOW}System logs (last 10 WireGuard-related entries):${NC}"
+    if command -v log &> /dev/null; then
+        log show --last 1h --predicate 'process CONTAINS "wireguard" OR eventMessage CONTAINS "wireguard"' --info 2>/dev/null | tail -10 || echo -e "${YELLOW}No system logs found${NC}"
+    else
+        echo -e "${YELLOW}System log viewing not available${NC}"
+    fi
+}
+
+# Function to fix permissions
+fix_permissions() {
+    clear_below_metrics
+    echo -e "${BLUE}Fix File Permissions${NC}"
+    echo -e "${BLUE}══════════════════════════════════════${NC}"
+    
+    echo -e "${YELLOW}Checking and fixing WireGuard configuration permissions...${NC}"
+    
+    if [ ! -d "$USER_CONFIG_DIR" ]; then
+        echo -e "${YELLOW}Creating configuration directory...${NC}"
+        mkdir -p "$USER_CONFIG_DIR"
+        chmod 700 "$USER_CONFIG_DIR"
+        echo -e "${GREEN}  ✓ Created $USER_CONFIG_DIR${NC}"
+    fi
+    
+    # Fix directory permissions
+    chmod 700 "$USER_CONFIG_DIR"
+    echo -e "${GREEN}  ✓ Set directory permissions to 700${NC}"
+    
+    # Fix configuration file permissions
+    local fixed_count=0
+    for config in "$USER_CONFIG_DIR"/*.conf; do
+        if [ -f "$config" ]; then
+            local current_perms=$(stat -f "%OLp" "$config" 2>/dev/null || stat -c "%a" "$config" 2>/dev/null)
+            if [ "$current_perms" != "600" ]; then
+                chmod 600 "$config"
+                echo -e "${GREEN}  ✓ Fixed permissions for $(basename "$config") ($current_perms → 600)${NC}"
+                fixed_count=$((fixed_count + 1))
+            else
+                echo -e "${GREEN}  ✓ $(basename "$config") permissions already correct${NC}"
+            fi
+        fi
+    done
+    
+    if [ $fixed_count -eq 0 ]; then
+        echo -e "${GREEN}All permissions are already correct!${NC}"
+    else
+        echo -e "${GREEN}Fixed permissions for $fixed_count configuration file(s)${NC}"
+    fi
 }
 
 # Function to toggle metrics display
@@ -683,6 +1231,11 @@ process_menu_selection() {
             return
             ;;
         6)
+            run_diagnostics
+            # Return to menu automatically
+            return
+            ;;
+        7)
             stop_metrics_display
             echo -e "${GREEN}Goodbye!${NC}"
             exit 0

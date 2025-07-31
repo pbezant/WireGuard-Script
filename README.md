@@ -88,6 +88,105 @@ Key compatibility features:
 
 ## Troubleshooting
 
+### Common Issues and Solutions
+
+#### Error 1: Connection Failed
+If you get "error 1" when connecting:
+
+1. **Run the diagnostic tools** (option 6 in the main menu):
+   - Test your configuration file
+   - Check network connectivity
+   - Verify endpoint reachability
+
+2. **Check configuration file format**:
+   ```
+   [Interface]
+   PrivateKey = your-private-key-here
+   Address = 10.0.0.2/32
+   DNS = 8.8.8.8
+   
+   [Peer]
+   PublicKey = server-public-key-here
+   AllowedIPs = 0.0.0.0/0
+   Endpoint = your-server.com:51820
+   ```
+
+3. **Common fixes**:
+   ```bash
+   # Fix file permissions
+   chmod 600 ~/.wireguard/*.conf
+   
+   # Test endpoint connectivity
+   nc -z your-server.com 51820
+   
+   # Check if another VPN is running
+   sudo wg show
+   ```
+
+#### Permission Denied Errors
+- Run the "Fix permissions" tool from the diagnostic menu
+- Ensure you're not running the script as root
+- Check that configuration files have 600 permissions
+
+#### Network Unreachable
+- Verify your internet connection
+- Test if the WireGuard server endpoint is reachable
+- Check if your firewall is blocking the connection
+- Try a different DNS server in your configuration
+
+#### Interface Already Exists
+- Disconnect any existing WireGuard connections first
+- Use option 3 to disconnect, then try connecting again
+- Check for other VPN software that might conflict
+
+### Configuration Examples
+
+#### Basic VPN Configuration
+```ini
+[Interface]
+PrivateKey = your-private-key-here
+Address = 10.0.0.2/32
+DNS = 8.8.8.8, 1.1.1.1
+
+[Peer]
+PublicKey = server-public-key-here
+AllowedIPs = 0.0.0.0/0
+Endpoint = vpn.example.com:51820
+PersistentKeepalive = 25
+```
+
+#### Split Tunnel Configuration
+```ini
+[Interface]
+PrivateKey = your-private-key-here
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = server-public-key-here
+AllowedIPs = 10.0.0.0/24, 192.168.1.0/24
+Endpoint = vpn.example.com:51820
+```
+
+### Diagnostic Tools
+
+The script includes comprehensive diagnostic tools (option 6):
+
+1. **Configuration Testing**: Validates syntax and tests connectivity
+2. **Network Tests**: Checks internet and endpoint connectivity  
+3. **DNS Testing**: Verifies DNS resolution
+4. **System Info**: Shows WireGuard installation and interface status
+5. **Log Viewing**: Displays connection attempt logs
+6. **Permission Fixing**: Automatically fixes file permissions
+
+### Getting Help
+
+If you're still having issues:
+
+1. Run the diagnostic tools and note any errors
+2. Check the connection logs in `/tmp/wireguard_connection_*.log`
+3. Verify your configuration file format
+4. Test basic network connectivity
+
 - If you encounter permission issues, make sure you're not running the script as root
 - For connection problems, check that WireGuard tools are properly installed
 - The script will attempt multiple methods to connect/disconnect if the standard methods fail
